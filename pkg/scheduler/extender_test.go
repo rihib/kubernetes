@@ -353,8 +353,13 @@ func TestSchedulerWithExtenders(t *testing.T) {
 			}
 			sched.applyDefaultHandlers()
 
+			state := framework.NewCycleState()
 			podIgnored := &v1.Pod{}
-			result, err := sched.SchedulePod(ctx, fwk, framework.NewCycleState(), podIgnored)
+			feasibleNodes, diagnosis, err := sched.findFeasibleNodes(ctx, fwk, state, podIgnored)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			result, err := sched.SchedulePod(ctx, fwk, state, podIgnored, feasibleNodes, diagnosis)
 			if test.expectsErr {
 				if err == nil {
 					t.Errorf("Unexpected non-error, result %+v", result)

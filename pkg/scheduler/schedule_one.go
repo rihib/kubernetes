@@ -61,6 +61,38 @@ const (
 	numberOfHighestScoredNodesToReport = 3
 )
 
+/*
+	NOTE:
+		- 変更するたびに`k8s.io/kubernetes`/`pkg/scheduler`のユニットテストを実行する
+
+	TODO:
+	- [ ] まずデフォルトスケジューラーを使う場合に、どのパラメータをいじることができて、
+				それをどのようにいじると各パートの実行時間がどのように変わるかを調査し、スライドにまとめる
+		- scheduler_perfを実行してそれをプロファイリングできないだろうか？
+	- [ ] 並列にスコアリングまで行った後、coordinationフェーズとして安定マッチングを使って決定まで行う。
+				またはより簡単なマッチングを行う（単に最初のノードから上から順にバインドしていくなど。競合の解消のみを行う）
+	- [ ] Sparrowと同様に分散スケジューリングを行い、競合状態はlate bindingで解決する
+		- ジョブ数をm個、ジョブあたりの探索するNode数をd個とすると、一度にdm個のノードを探索してキューイングされているジョブ数が少ないところに予約する
+			- dはpercentageOfNodesToScoreと同じ概念？
+		- 分散スケジューリングすると、競合が発生したり、キューイングされているジョブ数が少なくても実際は処理に時間がかかっていてバインディングまでに時間がかかる場合があるため、
+			あらかじめ複数のノードに予約をしておいて、キューの先頭にその予約が来たらノードはスケジューラーに対してバインディングを要求し、最初に要求があったm個については実際にバインディングを行い、
+			それ以降にリクエストのあったdm-m個についてはキャンセルを通知する
+*/
+
+func (sched *Scheduler) ScheduleParallel(ctx context.Context) {
+	/*
+		- feasibleNodesを選ぶところまではシリアルに実行し、それ以降は並列に実行する
+			- ScheduleOne関数のバインドはgo func()で並列化されているので、この場合もそれで良いと思う
+		- 現在スケジューリング候補のノードになっているかはframework.NodeInfoにbool変数IsCandidateを持たせることで判定できるようにする
+	*/
+	// findNodesThatFitPodを使ってfeasibleNodesを取得。findNodesThatFitPodでnextStartNodeIndexが更新される
+	// feasibleNodesを引数として、新たに作ったscheduleEach関数を非同期に実行する（つまりschedulePodを並列にできれば良い）
+	// TODO: 現在スケジューリング中のノードの範囲を保持するには？
+}
+
+/*
+	FIXME: メインとなる関数。
+*/
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	logger := klog.FromContext(ctx)
@@ -107,7 +139,35 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
+	/*
+		FIXME: feasibleNodesを取得↓
+	*/
+	var scheduleResult ScheduleResult
+	var status *framework.Status
+	assumedPodInfo := podInfo
+
+	feasibleNodes, diagnosis, err := sched.findFeasibleNodes(ctx, fwk, state, pod)
+	if err != nil {
+		defer func() {
+			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
+		}()
+		if err == ErrNoNodesAvailable {
+			status = framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
+			scheduleResult = ScheduleResult{nominatingInfo: clearNominatedNode}
+		}
+	}
+	if !status.IsSuccess() {
+		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+		return
+	}
+	/*
+		FIXME: feasibleNodesを取得↑
+	*/
+
+	/*
+		FIXME: ここから下をgo func()で並列化する
+	*/
+	scheduleResult, assumedPodInfo, status = sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate, feasibleNodes, diagnosis)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
 		return
@@ -132,8 +192,39 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	}()
 }
 
+/*
+FIXME: 追加した
+*/
+func (sched *Scheduler) findFeasibleNodes(
+	ctx context.Context,
+	fwk framework.Framework,
+	state *framework.CycleState,
+	pod *v1.Pod,
+) (feasibleNodes []*framework.NodeInfo, diagnosis framework.Diagnosis, err error) {
+	trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
+	defer trace.LogIfLong(100 * time.Millisecond)
+	if err := sched.Cache.UpdateSnapshot(klog.FromContext(ctx), sched.nodeInfoSnapshot); err != nil {
+		return feasibleNodes, diagnosis, err
+	}
+	trace.Step("Snapshotting scheduler cache and node infos done")
+
+	if sched.nodeInfoSnapshot.NumNodes() == 0 {
+		return feasibleNodes, diagnosis, ErrNoNodesAvailable
+	}
+
+	feasibleNodes, diagnosis, err = sched.findNodesThatFitPod(ctx, fwk, state, pod)
+	if err != nil {
+		return feasibleNodes, diagnosis, err
+	}
+	trace.Step("Computing predicates done")
+	return feasibleNodes, diagnosis, err
+}
+
 var clearNominatedNode = &framework.NominatingInfo{NominatingMode: framework.ModeOverride, NominatedNodeName: ""}
 
+/*
+	FIXME: スケジューリングサイクル
+*/
 // schedulingCycle tries to schedule a single Pod.
 func (sched *Scheduler) schedulingCycle(
 	ctx context.Context,
@@ -142,18 +233,21 @@ func (sched *Scheduler) schedulingCycle(
 	podInfo *framework.QueuedPodInfo,
 	start time.Time,
 	podsToActivate *framework.PodsToActivate,
+	feasibleNodes []*framework.NodeInfo,
+	diagnosis framework.Diagnosis,
 ) (ScheduleResult, *framework.QueuedPodInfo, *framework.Status) {
 	logger := klog.FromContext(ctx)
 	pod := podInfo.Pod
-	scheduleResult, err := sched.SchedulePod(ctx, fwk, state, pod)
+	// FIXME: SchedulePod内ではfeasibleNodesを取得しないように変更
+	scheduleResult, err := sched.SchedulePod(ctx, fwk, state, pod, feasibleNodes, diagnosis)
 	if err != nil {
 		defer func() {
 			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
 		}()
-		if err == ErrNoNodesAvailable {
-			status := framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
-			return ScheduleResult{nominatingInfo: clearNominatedNode}, podInfo, status
-		}
+		// if err == ErrNoNodesAvailable {
+		// 	status := framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
+		// 	return ScheduleResult{nominatingInfo: clearNominatedNode}, podInfo, status
+		// }
 
 		fitError, ok := err.(*framework.FitError)
 		if !ok {
@@ -394,26 +488,36 @@ func (sched *Scheduler) skipPodSchedule(ctx context.Context, fwk framework.Frame
 	return isAssumed
 }
 
+/*
+	FIXME: Podをリストのうち１つのNodeにスケジュールを試みる
+*/
 // schedulePod tries to schedule the given pod to one of the nodes in the node list.
 // If it succeeds, it will return the name of the node.
 // If it fails, it will return a FitError with reasons.
-func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
+func (sched *Scheduler) schedulePod(
+	ctx context.Context,
+	fwk framework.Framework,
+	state *framework.CycleState,
+	pod *v1.Pod,
+	feasibleNodes []*framework.NodeInfo,
+	diagnosis framework.Diagnosis,
+) (result ScheduleResult, err error) {
 	trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
 	defer trace.LogIfLong(100 * time.Millisecond)
-	if err := sched.Cache.UpdateSnapshot(klog.FromContext(ctx), sched.nodeInfoSnapshot); err != nil {
-		return result, err
-	}
-	trace.Step("Snapshotting scheduler cache and node infos done")
+	// if err := sched.Cache.UpdateSnapshot(klog.FromContext(ctx), sched.nodeInfoSnapshot); err != nil {
+	// 	return result, err
+	// }
+	// trace.Step("Snapshotting scheduler cache and node infos done")
 
-	if sched.nodeInfoSnapshot.NumNodes() == 0 {
-		return result, ErrNoNodesAvailable
-	}
+	// if sched.nodeInfoSnapshot.NumNodes() == 0 {
+	// 	return result, ErrNoNodesAvailable
+	// }
 
-	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
-	if err != nil {
-		return result, err
-	}
-	trace.Step("Computing predicates done")
+	// feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+	// if err != nil {
+	// 	return result, err
+	// }
+	// trace.Step("Computing predicates done")
 
 	if len(feasibleNodes) == 0 {
 		return result, &framework.FitError{
@@ -865,6 +969,12 @@ func prioritizeNodes(
 
 var errEmptyPriorityList = errors.New("empty priorityList")
 
+/*
+	FIXME:
+	selectHostはスコアの高いノードのリストの中から、１つのノードを選ぶ。
+	大きさが不明の集合からランダムにk個の要素を均等に選ぶアルゴリズムであるリザーバーサンプリング（Reservoir sampling）が使われている。
+	特定のノードが常に高いスコアを持つ場合でも、そのノードばかりが偏って選ばれるリスクを減らすことができる。
+*/
 // selectHost takes a prioritized list of nodes and then picks one
 // in a reservoir sampling manner from the nodes that had the highest score.
 // It also returns the top {count} Nodes,
