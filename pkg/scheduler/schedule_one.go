@@ -64,37 +64,16 @@ const (
 /*
 	NOTE:
 		- 変更するたびに`k8s.io/kubernetes`/`pkg/scheduler`のユニットテストを実行する
-
-	TODO:
-	- [ ] まずデフォルトスケジューラーを使う場合に、どのパラメータをいじることができて、
-				それをどのようにいじると各パートの実行時間がどのように変わるかを調査し、スライドにまとめる
-		- scheduler_perfを実行してそれをプロファイリングできないだろうか？
-	- [ ] 並列にスコアリングまで行った後、coordinationフェーズとして安定マッチングを使って決定まで行う。
-				またはより簡単なマッチングを行う（単に最初のノードから上から順にバインドしていくなど。競合の解消のみを行う）
-	- [ ] Sparrowと同様に分散スケジューリングを行い、競合状態はlate bindingで解決する
-		- ジョブ数をm個、ジョブあたりの探索するNode数をd個とすると、一度にdm個のノードを探索してキューイングされているジョブ数が少ないところに予約する
-			- dはpercentageOfNodesToScoreと同じ概念？
-		- 分散スケジューリングすると、競合が発生したり、キューイングされているジョブ数が少なくても実際は処理に時間がかかっていてバインディングまでに時間がかかる場合があるため、
-			あらかじめ複数のノードに予約をしておいて、キューの先頭にその予約が来たらノードはスケジューラーに対してバインディングを要求し、最初に要求があったm個については実際にバインディングを行い、
-			それ以降にリクエストのあったdm-m個についてはキャンセルを通知する
 */
-
-func (sched *Scheduler) ScheduleParallel(ctx context.Context) {
-	/*
-		- feasibleNodesを選ぶところまではシリアルに実行し、それ以降は並列に実行する
-			- ScheduleOne関数のバインドはgo func()で並列化されているので、この場合もそれで良いと思う
-		- 現在スケジューリング候補のノードになっているかはframework.NodeInfoにbool変数IsCandidateを持たせることで判定できるようにする
-	*/
-	// findNodesThatFitPodを使ってfeasibleNodesを取得。findNodesThatFitPodでnextStartNodeIndexが更新される
-	// feasibleNodesを引数として、新たに作ったscheduleEach関数を非同期に実行する（つまりschedulePodを並列にできれば良い）
-	// TODO: 現在スケジューリング中のノードの範囲を保持するには？
-}
 
 /*
-	FIXME: メインとなる関数。
+	NOTE: メインとなる関数。
+	- for文で、Podを取り出し、feasibleNodesを取得して、go funcで以降のスケジューリングを行うのを繰り返す
+	- for文はfeasbileNodesがnextStartNodeIndexが最後の方まで行って十分な数のfeasibleNodesを取得できなくなったら終了する
+	- ScheduleOne関数自体は全てのgo funcの実行が終了したら終了する
 */
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
-func (sched *Scheduler) ScheduleOne(ctx context.Context) {
+func (sched *Scheduler) ScheduleOneOld(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	podInfo, err := sched.NextPod(logger)
 	if err != nil {
@@ -139,9 +118,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	/*
-		FIXME: feasibleNodesを取得↓
-	*/
+	// CHANGED: feasibleNodesを取得↓
 	var scheduleResult ScheduleResult
 	var status *framework.Status
 	assumedPodInfo := podInfo
@@ -160,12 +137,15 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
 		return
 	}
-	/*
-		FIXME: feasibleNodesを取得↑
-	*/
+	// CHANGED: feasibleNodesを取得↑
 
 	/*
-		FIXME: ここから下をgo func()で並列化する
+		NOTE: ここから下をgo func()で並列化する
+		- findFeasbielNodesでnextStartNodeIndexが更新される
+		- あくまで新たに並列化するのはReserveのところまで。以降のバインドはそのままで良い
+		- Nodeの数が足りなくてスケジュールできなくなるまで、NextPodを取り出し、FeasibleNodesを取得し、スケジューリングを行う
+		- nextStartNodeIndexが最後の方まで行ってFeasibleNodesの取得ができなくなったら、非同期で実行しているスケジューリングが全て終わるまで待ち、全て終わって全てバインドの段階になったら、その時点のScheduleOne関数の実行を終了して、次のScheduleOne関数を実行する
+			- つまりFeasibleNodesを取得する際はインデックスの先頭に戻るということはしないようにしないといけない
 	*/
 	scheduleResult, assumedPodInfo, status = sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate, feasibleNodes, diagnosis)
 	if !status.IsSuccess() {
@@ -192,9 +172,112 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	}()
 }
 
-/*
-FIXME: 追加した
-*/
+// CHANGED
+// ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
+func (sched *Scheduler) ScheduleOne(ctx context.Context) {
+	sched.startNodeIndex = sched.nextStartNodeIndex
+
+	var wg sync.WaitGroup
+	for {
+		logger := klog.FromContext(ctx)
+		podInfo, err := sched.NextPod(logger)
+		if err != nil {
+			logger.Error(err, "Error while retrieving next pod from scheduling queue")
+			break // CHANGED
+		}
+		// pod could be nil when schedulerQueue is closed
+		if podInfo == nil || podInfo.Pod == nil {
+			break // CHANGED
+		}
+
+		pod := podInfo.Pod
+		// TODO(knelasevero): Remove duplicated keys from log entry calls
+		// When contextualized logging hits GA
+		// https://github.com/kubernetes/kubernetes/issues/111672
+		logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
+		ctx = klog.NewContext(ctx, logger)
+		logger.V(4).Info("About to try and schedule pod", "pod", klog.KObj(pod))
+
+		fwk, err := sched.frameworkForPod(pod)
+		if err != nil {
+			// This shouldn't happen, because we only accept for scheduling the pods
+			// which specify a scheduler name that matches one of the profiles.
+			logger.Error(err, "Error occurred")
+			continue
+		}
+		if sched.skipPodSchedule(ctx, fwk, pod) {
+			continue
+		}
+
+		logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
+
+		// Synchronously attempt to find a fit for the pod.
+		start := time.Now()
+		state := framework.NewCycleState()
+		state.SetRecordPluginMetrics(rand.Intn(100) < pluginMetricsSamplePercent)
+
+		// Initialize an empty podsToActivate struct, which will be filled up by plugins or stay empty.
+		podsToActivate := framework.NewPodsToActivate()
+		state.Write(framework.PodsToActivateKey, podsToActivate)
+
+		schedulingCycleCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		var scheduleResult ScheduleResult
+		var status *framework.Status
+		assumedPodInfo := podInfo
+
+		feasibleNodes, diagnosis, err := sched.findFeasibleNodes(ctx, fwk, state, pod)
+		// ADDED: errがsched.startNodeIndexを超えたというエラーであれば、breakする
+		if err == fmt.Errorf("step over the startNodeIndex") {
+			break
+		}
+		if err != nil {
+			defer func() {
+				metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
+			}()
+			if err == ErrNoNodesAvailable {
+				status = framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
+				scheduleResult = ScheduleResult{nominatingInfo: clearNominatedNode}
+			}
+		}
+		if !status.IsSuccess() {
+			sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+			continue
+		}
+
+		wg.Add(1)
+		go func() {
+			scheduleResult, assumedPodInfo, status = sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate, feasibleNodes, diagnosis)
+			if !status.IsSuccess() {
+				sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+				return
+			}
+			wg.Done()
+
+			// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
+			go func() {
+				bindingCycleCtx, cancel := context.WithCancel(ctx)
+				defer cancel()
+
+				metrics.Goroutines.WithLabelValues(metrics.Binding).Inc()
+				defer metrics.Goroutines.WithLabelValues(metrics.Binding).Dec()
+
+				status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
+				if !status.IsSuccess() {
+					sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
+					return
+				}
+				// Usually, DonePod is called inside the scheduling queue,
+				// but in this case, we need to call it here because this Pod won't go back to the scheduling queue.
+				sched.SchedulingQueue.Done(assumedPodInfo.Pod.UID)
+			}()
+		}()
+	}
+	wg.Wait()
+}
+
+// ADDED
 func (sched *Scheduler) findFeasibleNodes(
 	ctx context.Context,
 	fwk framework.Framework,
@@ -213,6 +296,7 @@ func (sched *Scheduler) findFeasibleNodes(
 	}
 
 	feasibleNodes, diagnosis, err = sched.findNodesThatFitPod(ctx, fwk, state, pod)
+	// NOTE: sched.startNodeIndexを超えたというエラーの場合も、そのままそのエラーを返す
 	if err != nil {
 		return feasibleNodes, diagnosis, err
 	}
@@ -222,9 +306,7 @@ func (sched *Scheduler) findFeasibleNodes(
 
 var clearNominatedNode = &framework.NominatingInfo{NominatingMode: framework.ModeOverride, NominatedNodeName: ""}
 
-/*
-	FIXME: スケジューリングサイクル
-*/
+// NOTE: スケジューリングサイクル
 // schedulingCycle tries to schedule a single Pod.
 func (sched *Scheduler) schedulingCycle(
 	ctx context.Context,
@@ -238,7 +320,7 @@ func (sched *Scheduler) schedulingCycle(
 ) (ScheduleResult, *framework.QueuedPodInfo, *framework.Status) {
 	logger := klog.FromContext(ctx)
 	pod := podInfo.Pod
-	// FIXME: SchedulePod内ではfeasibleNodesを取得しないように変更
+	// CHANGED: SchedulePod内ではfeasibleNodesを取得しないように変更
 	scheduleResult, err := sched.SchedulePod(ctx, fwk, state, pod, feasibleNodes, diagnosis)
 	if err != nil {
 		defer func() {
@@ -488,9 +570,7 @@ func (sched *Scheduler) skipPodSchedule(ctx context.Context, fwk framework.Frame
 	return isAssumed
 }
 
-/*
-	FIXME: Podをリストのうち１つのNodeにスケジュールを試みる
-*/
+// NOTE: Podをリストのうち１つのNodeにスケジュールを試みる
 // schedulePod tries to schedule the given pod to one of the nodes in the node list.
 // If it succeeds, it will return the name of the node.
 // If it fails, it will return a FitError with reasons.
@@ -588,6 +668,10 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
 	if len(pod.Status.NominatedNodeName) > 0 {
 		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
+		// ADDED: errがsched.startNodeIndexを超えたというエラーであれば、そのままそのエラーを返す
+		if err == fmt.Errorf("step over the startNodeIndex") {
+			return nil, diagnosis, err
+		}
 		if err != nil {
 			logger.Error(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
 		}
@@ -609,6 +693,10 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 		}
 	}
 	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, &diagnosis, nodes)
+	// ADDED: errがsched.startNodeIndexを超えたというエラーであれば、そのままそのエラーを返す
+	if err == fmt.Errorf("step over the startNodeIndex") {
+		return nil, diagnosis, err
+	}
 	// always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
 	// this is helpful to make sure that all the nodes have a chance to be searched
 	processedNodes := len(feasibleNodes) + len(diagnosis.NodeToStatusMap)
@@ -694,6 +782,17 @@ func (sched *Scheduler) findNodesThatPassFilters(
 	numNodesToFind := sched.numFeasibleNodesToFind(fwk.PercentageOfNodesToScore(), int32(numAllNodes))
 	if !sched.hasExtenderFilters() && !sched.hasScoring(fwk) {
 		numNodesToFind = 1
+	}
+	// ADDED: 現在のnextStartNodeIndex+numNodesToFindがsched.startNodeIndexを超えるようであればエラーを返す
+	endNodeIndex := sched.nextStartNodeIndex + int(numNodesToFind)
+	if sched.startNodeIndex <= sched.nextStartNodeIndex {
+		if endNodeIndex >= numAllNodes && sched.startNodeIndex <= endNodeIndex%numAllNodes {
+			return nil, fmt.Errorf("step over the startNodeIndex")
+		}
+	} else {
+		if sched.startNodeIndex <= endNodeIndex {
+			return nil, fmt.Errorf("step over the startNodeIndex")
+		}
 	}
 
 	// Create feasible list with enough space to avoid growing it
@@ -970,7 +1069,7 @@ func prioritizeNodes(
 var errEmptyPriorityList = errors.New("empty priorityList")
 
 /*
-	FIXME:
+	NOTE:
 	selectHostはスコアの高いノードのリストの中から、１つのノードを選ぶ。
 	大きさが不明の集合からランダムにk個の要素を均等に選ぶアルゴリズムであるリザーバーサンプリング（Reservoir sampling）が使われている。
 	特定のノードが常に高いスコアを持つ場合でも、そのノードばかりが偏って選ばれるリスクを減らすことができる。

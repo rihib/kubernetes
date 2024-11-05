@@ -101,6 +101,8 @@ type Scheduler struct {
 
 	nextStartNodeIndex int
 
+	startNodeIndex int // ADDED
+
 	// logger *must* be initialized when creating a Scheduler,
 	// otherwise logging functions will access a nil sink and
 	// panic.
