@@ -62,116 +62,12 @@ const (
 )
 
 /*
-	NOTE:
-		- 変更するたびに`k8s.io/kubernetes`/`pkg/scheduler`のユニットテストを実行する
-*/
-
-/*
 	NOTE: メインとなる関数。
+	- 変更するたびに`k8s.io/kubernetes`/`pkg/scheduler`のユニットテストを実行する
 	- for文で、Podを取り出し、feasibleNodesを取得して、go funcで以降のスケジューリングを行うのを繰り返す
 	- for文はfeasbileNodesがnextStartNodeIndexが最後の方まで行って十分な数のfeasibleNodesを取得できなくなったら終了する
 	- ScheduleOne関数自体は全てのgo funcの実行が終了したら終了する
 */
-// ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
-func (sched *Scheduler) ScheduleOneOld(ctx context.Context) {
-	logger := klog.FromContext(ctx)
-	podInfo, err := sched.NextPod(logger)
-	if err != nil {
-		logger.Error(err, "Error while retrieving next pod from scheduling queue")
-		return
-	}
-	// pod could be nil when schedulerQueue is closed
-	if podInfo == nil || podInfo.Pod == nil {
-		return
-	}
-
-	pod := podInfo.Pod
-	// TODO(knelasevero): Remove duplicated keys from log entry calls
-	// When contextualized logging hits GA
-	// https://github.com/kubernetes/kubernetes/issues/111672
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
-	ctx = klog.NewContext(ctx, logger)
-	logger.V(4).Info("About to try and schedule pod", "pod", klog.KObj(pod))
-
-	fwk, err := sched.frameworkForPod(pod)
-	if err != nil {
-		// This shouldn't happen, because we only accept for scheduling the pods
-		// which specify a scheduler name that matches one of the profiles.
-		logger.Error(err, "Error occurred")
-		return
-	}
-	if sched.skipPodSchedule(ctx, fwk, pod) {
-		return
-	}
-
-	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
-
-	// Synchronously attempt to find a fit for the pod.
-	start := time.Now()
-	state := framework.NewCycleState()
-	state.SetRecordPluginMetrics(rand.Intn(100) < pluginMetricsSamplePercent)
-
-	// Initialize an empty podsToActivate struct, which will be filled up by plugins or stay empty.
-	podsToActivate := framework.NewPodsToActivate()
-	state.Write(framework.PodsToActivateKey, podsToActivate)
-
-	schedulingCycleCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// CHANGED: feasibleNodesを取得↓
-	var scheduleResult ScheduleResult
-	var status *framework.Status
-	assumedPodInfo := podInfo
-
-	feasibleNodes, diagnosis, err := sched.findFeasibleNodes(ctx, fwk, state, pod)
-	if err != nil {
-		defer func() {
-			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
-		}()
-		if err == ErrNoNodesAvailable {
-			status = framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
-			scheduleResult = ScheduleResult{nominatingInfo: clearNominatedNode}
-		}
-	}
-	if !status.IsSuccess() {
-		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
-		return
-	}
-	// CHANGED: feasibleNodesを取得↑
-
-	/*
-		NOTE: ここから下をgo func()で並列化する
-		- findFeasbielNodesでnextStartNodeIndexが更新される
-		- あくまで新たに並列化するのはReserveのところまで。以降のバインドはそのままで良い
-		- Nodeの数が足りなくてスケジュールできなくなるまで、NextPodを取り出し、FeasibleNodesを取得し、スケジューリングを行う
-		- nextStartNodeIndexが最後の方まで行ってFeasibleNodesの取得ができなくなったら、非同期で実行しているスケジューリングが全て終わるまで待ち、全て終わって全てバインドの段階になったら、その時点のScheduleOne関数の実行を終了して、次のScheduleOne関数を実行する
-			- つまりFeasibleNodesを取得する際はインデックスの先頭に戻るということはしないようにしないといけない
-	*/
-	scheduleResult, assumedPodInfo, status = sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate, feasibleNodes, diagnosis)
-	if !status.IsSuccess() {
-		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
-		return
-	}
-
-	// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
-	go func() {
-		bindingCycleCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		metrics.Goroutines.WithLabelValues(metrics.Binding).Inc()
-		defer metrics.Goroutines.WithLabelValues(metrics.Binding).Dec()
-
-		status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
-		if !status.IsSuccess() {
-			sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
-			return
-		}
-		// Usually, DonePod is called inside the scheduling queue,
-		// but in this case, we need to call it here because this Pod won't go back to the scheduling queue.
-		sched.SchedulingQueue.Done(assumedPodInfo.Pod.UID)
-	}()
-}
-
 // CHANGED
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
@@ -203,10 +99,10 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 			// This shouldn't happen, because we only accept for scheduling the pods
 			// which specify a scheduler name that matches one of the profiles.
 			logger.Error(err, "Error occurred")
-			continue
+			break
 		}
 		if sched.skipPodSchedule(ctx, fwk, pod) {
-			continue
+			break
 		}
 
 		logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
@@ -228,14 +124,11 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		assumedPodInfo := podInfo
 
 		feasibleNodes, diagnosis, err := sched.findFeasibleNodes(ctx, fwk, state, pod)
-		// ADDED: errがsched.startNodeIndexを超えたというエラーであれば、breakする
-		if err == fmt.Errorf("step over the startNodeIndex") {
-			break
-		}
 		if err != nil {
 			defer func() {
 				metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
 			}()
+			// NOTE: 範囲を超えてしまった場合もErrNoNodesAvailableが返される
 			if err == ErrNoNodesAvailable {
 				status = framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
 				scheduleResult = ScheduleResult{nominatingInfo: clearNominatedNode}
@@ -243,7 +136,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		}
 		if !status.IsSuccess() {
 			sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
-			continue
+			break
 		}
 
 		wg.Add(1)
@@ -669,7 +562,7 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 	if len(pod.Status.NominatedNodeName) > 0 {
 		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
 		// ADDED: errがsched.startNodeIndexを超えたというエラーであれば、そのままそのエラーを返す
-		if err == fmt.Errorf("step over the startNodeIndex") {
+		if err == ErrNoNodesAvailable {
 			return nil, diagnosis, err
 		}
 		if err != nil {
@@ -694,7 +587,7 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 	}
 	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, &diagnosis, nodes)
 	// ADDED: errがsched.startNodeIndexを超えたというエラーであれば、そのままそのエラーを返す
-	if err == fmt.Errorf("step over the startNodeIndex") {
+	if err == ErrNoNodesAvailable {
 		return nil, diagnosis, err
 	}
 	// always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
@@ -787,11 +680,11 @@ func (sched *Scheduler) findNodesThatPassFilters(
 	endNodeIndex := sched.nextStartNodeIndex + int(numNodesToFind)
 	if sched.startNodeIndex <= sched.nextStartNodeIndex {
 		if endNodeIndex >= numAllNodes && sched.startNodeIndex <= endNodeIndex%numAllNodes {
-			return nil, fmt.Errorf("step over the startNodeIndex")
+			return nil, ErrNoNodesAvailable
 		}
 	} else {
 		if sched.startNodeIndex <= endNodeIndex {
-			return nil, fmt.Errorf("step over the startNodeIndex")
+			return nil, ErrNoNodesAvailable
 		}
 	}
 
