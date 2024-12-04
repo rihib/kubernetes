@@ -59,6 +59,8 @@ const (
 	// numberOfHighestScoredNodesToReport is the number of node scores
 	// to be included in ScheduleResult.
 	numberOfHighestScoredNodesToReport = 3
+
+	parallelLimit = 2
 )
 
 /*
@@ -74,7 +76,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	sched.startNodeIndex = sched.nextStartNodeIndex
 
 	var wg sync.WaitGroup
-	for {
+	for range parallelLimit {
 		logger := klog.FromContext(ctx)
 		podInfo, err := sched.NextPod(logger)
 		if err != nil {
@@ -144,6 +146,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 			scheduleResult, assumedPodInfo, status = sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate, feasibleNodes, diagnosis)
 			if !status.IsSuccess() {
 				sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+				wg.Done()
 				return
 			}
 			wg.Done()
