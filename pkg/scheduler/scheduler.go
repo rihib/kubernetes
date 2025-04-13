@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"runtime/trace"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -81,7 +83,8 @@ type Scheduler struct {
 	// SchedulePod tries to schedule the given pod to one of the nodes in the node list.
 	// Return a struct of ScheduleResult with the name of suggested host on success,
 	// otherwise will return a FitError with reasons.
-	SchedulePod func(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) (ScheduleResult, error)
+	SchedulePod func(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod, feasibleNodes []*framework.NodeInfo,
+		diagnosis framework.Diagnosis) (ScheduleResult, error)
 
 	// Close this to shut down the scheduler.
 	StopEverything <-chan struct{}
@@ -99,6 +102,8 @@ type Scheduler struct {
 	percentageOfNodesToScore int32
 
 	nextStartNodeIndex int
+
+	startNodeIndex int // ADDED
 
 	// logger *must* be initialized when creating a Scheduler,
 	// otherwise logging functions will access a nil sink and
@@ -461,19 +466,39 @@ func (sched *Scheduler) Run(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	sched.SchedulingQueue.Run(logger)
 
+	// トレースファイルを作成
+	f, err := os.Create("trace.out")
+	if err != nil {
+		logger.Error(err, "Failed to create trace file")
+		return
+	}
+	defer f.Close()
+
+	// トレースの開始
+	if err := trace.Start(f); err != nil {
+		logger.Error(err, "Failed to start trace")
+		return
+	}
+	defer trace.Stop()
+
 	// We need to start scheduleOne loop in a dedicated goroutine,
 	// because scheduleOne function hangs on getting the next item
 	// from the SchedulingQueue.
 	// If there are no new pods to schedule, it will be hanging there
 	// and if done in this goroutine it will be blocking closing
 	// SchedulingQueue, in effect causing a deadlock on shutdown.
-	go wait.UntilWithContext(ctx, sched.ScheduleOne, 0)
+	// トレースを含むスケジューリングループの開始
+	go wait.UntilWithContext(ctx, func(ctx context.Context) {
+		traceCtx, task := trace.NewTask(ctx, "ScheduleOne")
+		defer task.End()
+		sched.ScheduleOne(traceCtx)
+	}, 0)
 
 	<-ctx.Done()
 	sched.SchedulingQueue.Close()
 
 	// If the plugins satisfy the io.Closer interface, they are closed.
-	err := sched.Profiles.Close()
+	err = sched.Profiles.Close()
 	if err != nil {
 		logger.Error(err, "Failed to close plugins")
 	}

@@ -795,7 +795,14 @@ func TestSchedulerScheduleOne(t *testing.T) {
 				Profiles:        profile.Map{testSchedulerName: fwk},
 			}
 
-			sched.SchedulePod = func(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) (ScheduleResult, error) {
+			sched.SchedulePod = func(
+				ctx context.Context,
+				fwk framework.Framework,
+				state *framework.CycleState,
+				pod *v1.Pod,
+				feasibleNodes []*framework.NodeInfo,
+				diagnosis framework.Diagnosis,
+			) (ScheduleResult, error) {
 				return item.mockResult.result, item.mockResult.err
 			}
 			sched.FailureHandler = func(_ context.Context, fwk framework.Framework, p *framework.QueuedPodInfo, status *framework.Status, _ *framework.NominatingInfo, _ time.Time) {
@@ -2504,7 +2511,12 @@ func TestSchedulerSchedulePod(t *testing.T) {
 			informerFactory.Start(ctx.Done())
 			informerFactory.WaitForCacheSync(ctx.Done())
 
-			result, err := sched.SchedulePod(ctx, fwk, framework.NewCycleState(), test.pod)
+			state := framework.NewCycleState()
+			feasibleNodes, diagnosis, err := sched.findFeasibleNodes(ctx, fwk, state, test.pod)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			result, err := sched.SchedulePod(ctx, fwk, state, test.pod, feasibleNodes, diagnosis)
 			if err != test.wErr {
 				gotFitErr, gotOK := err.(*framework.FitError)
 				wantFitErr, wantOK := test.wErr.(*framework.FitError)
